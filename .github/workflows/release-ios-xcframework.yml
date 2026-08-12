@@ -23,7 +23,12 @@ jobs:
   build:
     # Pinned rather than macos-latest: the Xcode and SDK version determine what
     # gets compiled in, so moving it should be a deliberate act.
-    runs-on: macos-15
+    #
+    # This must stay on an Xcode whose LLVM is close to the one Rust ships
+    # (1.93 => LLVM 21). The release profile uses fat LTO, so the objects carry
+    # bitcode, and a toolchain several majors older cannot read it — macos-15
+    # (Xcode 16.4, LLVM 17) fails with "Unknown attribute kind".
+    runs-on: macos-26
 
     permissions:
       contents: write # cut the release
@@ -40,10 +45,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Logged first: an Xcode/LLVM mismatch against the Rust toolchain shows up
+      # much later as unreadable object files, so make it visible up front.
+      - name: report the toolchain
+        run: |
+          ls -d /Applications/Xcode*.app
+          xcodebuild -version
+          nm --version | head -2
+
       - name: install the pinned Rust toolchain
         run: |
           rustup toolchain install "$RUST_VERSION" --profile minimal
           rustup default "$RUST_VERSION"
+          rustup component add llvm-tools-preview
           rustup target add aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios
           rustc --version
 
@@ -132,9 +146,20 @@ jobs:
       - name: verify the framework before publishing it
         run: |
           cd "$XCF_DIR"
+
+          # Read the objects with the LLVM that produced them. The release
+          # profile uses fat LTO, so members carry bitcode that only a matching
+          # (or newer) LLVM can parse; Xcode's own nm may be older than Rust's.
+          LLVM_NM="$(find "$(rustc --print sysroot)/lib/rustlib" -name 'llvm-nm' -type f | head -n1)"
+          if [ -z "$LLVM_NM" ]; then
+            echo "llvm-nm not found — is the llvm-tools-preview component installed?" >&2
+            exit 1
+          fi
+          echo "using $LLVM_NM"
+
           # The entry point consumers call. A framework missing it links fine and
           # only fails later, at runtime.
-          nm -g libcircom_witnesscalc.xcframework/ios-arm64/libcircom_witnesscalc.a \
+          "$LLVM_NM" -g libcircom_witnesscalc.xcframework/ios-arm64/libcircom_witnesscalc.a \
             | grep -q 'T _gw_calc_witness' \
             || { echo "gw_calc_witness missing from the device slice" >&2; exit 1; }
 
