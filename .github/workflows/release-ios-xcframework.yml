@@ -1,0 +1,189 @@
+# Builds the iOS xcframework for libcircom_witnesscalc and publishes it as a
+# release asset with signed build provenance.
+#
+# This branch is pinned: everything below .github/ is upstream
+# iden3/circom-witnesscalc at ae15c65bfa896726c6fa293d7ce8e2b18a9625b0.
+# Nothing here should change the source — only how it is built and shipped.
+#
+#   workflow_dispatch            builds and uploads a workflow artifact, no release
+#   push tag ios-xcframework-v*  builds and cuts a release
+#
+# Consumers pin the published asset by SHA-256. Take that digest from the
+# release asset, never from a local build.
+
+name: Release iOS xcframework
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'ios-xcframework-v*'
+
+jobs:
+  build:
+    # Pinned rather than macos-latest: the Xcode and SDK version determine what
+    # gets compiled in, so moving it should be a deliberate act.
+    runs-on: macos-15
+
+    permissions:
+      contents: write # cut the release
+      id-token: write # sign the provenance attestation
+      attestations: write
+
+    env:
+      RUST_VERSION: '1.93.0'
+      # Keep build-machine paths out of a binary that ships inside an app.
+      # Cargo registry paths otherwise end up in panic strings, and from there
+      # in the debug symbols published downstream.
+      CARGO_PROFILE_RELEASE_DEBUG: '0'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install the pinned Rust toolchain
+        run: |
+          rustup toolchain install "$RUST_VERSION" --profile minimal
+          rustup default "$RUST_VERSION"
+          rustup target add aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios
+          rustc --version
+
+      - name: build the three iOS targets
+        run: |
+          IOS_SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
+          IOS_SIM_SDK="$(xcrun --sdk iphonesimulator --show-sdk-path)"
+          echo "device sdk:    $IOS_SDK"
+          echo "simulator sdk: $IOS_SIM_SDK"
+
+          # build.rs runs bindgen, whose libclang cannot find system headers
+          # (stdlib.h) when cross-compiling without an explicit sysroot. The
+          # variable names are target-suffixed, so exporting all three lets a
+          # single `make lib-ios` pick the right one per target.
+          export BINDGEN_EXTRA_CLANG_ARGS_aarch64_apple_ios="--sysroot=$IOS_SDK"
+          export BINDGEN_EXTRA_CLANG_ARGS_aarch64_apple_ios_sim="--sysroot=$IOS_SIM_SDK"
+          export BINDGEN_EXTRA_CLANG_ARGS_x86_64_apple_ios="--sysroot=$IOS_SIM_SDK"
+
+          export RUSTFLAGS="--remap-path-prefix=$HOME/.cargo=/cargo --remap-path-prefix=$GITHUB_WORKSPACE=/src"
+
+          # Upstream's own targets: lib-ios-device + lib-ios-sim.
+          make lib-ios
+
+      - name: assemble the xcframework
+        run: |
+          OUT="$RUNNER_TEMP/xcf"
+          rm -rf "$OUT"
+          mkdir -p "$OUT/sim" "$OUT/headers"
+
+          # Minimal C interface for the Swift wrapper: gw_calc_witness and the
+          # status struct it reads. Declared here rather than taken from the
+          # source tree so the published framework's header is explicit.
+          cat > "$OUT/headers/libcircom_witnesscalc.h" <<'HEADER'
+          #include <stddef.h>
+
+          #ifndef RUST_GRAPH_WITNESS_H
+          #define RUST_GRAPH_WITNESS_H
+
+          #ifdef __cplusplus
+          extern "C" {
+          #endif
+
+          typedef enum {
+            OK = 0,
+            ERROR = 1
+          } GW_ERROR_CODE;
+
+          typedef struct {
+            GW_ERROR_CODE code;
+            char *error_msg;
+          } gw_status_t;
+
+          int
+          gw_calc_witness(const char *inputs,
+                          const void *graph_data, const size_t graph_data_len,
+                          void **wtns_data, size_t *wtns_len,
+                          const gw_status_t *status);
+
+          #ifdef __cplusplus
+          }
+          #endif
+
+          #endif // RUST_GRAPH_WITNESS_H
+          HEADER
+
+          lipo -create \
+            target/aarch64-apple-ios-sim/release/libcircom_witnesscalc.a \
+            target/x86_64-apple-ios/release/libcircom_witnesscalc.a \
+            -output "$OUT/sim/libcircom_witnesscalc.a"
+
+          xcodebuild -create-xcframework \
+            -library target/aarch64-apple-ios/release/libcircom_witnesscalc.a -headers "$OUT/headers" \
+            -library "$OUT/sim/libcircom_witnesscalc.a" -headers "$OUT/headers" \
+            -output "$OUT/libcircom_witnesscalc.xcframework"
+
+          echo "XCF_DIR=$OUT" >> "$GITHUB_ENV"
+
+      - name: verify the framework before publishing it
+        run: |
+          cd "$XCF_DIR"
+          # The entry point consumers call. A framework missing it links fine and
+          # only fails later, at runtime.
+          nm -g libcircom_witnesscalc.xcframework/ios-arm64/libcircom_witnesscalc.a \
+            | grep -q 'T _gw_calc_witness' \
+            || { echo "gw_calc_witness missing from the device slice" >&2; exit 1; }
+
+          lipo -info libcircom_witnesscalc.xcframework/ios-arm64/libcircom_witnesscalc.a
+          lipo -info libcircom_witnesscalc.xcframework/ios-arm64_x86_64-simulator/libcircom_witnesscalc.a
+
+          # No build-machine paths should survive the remapping above.
+          if strings -a libcircom_witnesscalc.xcframework/ios-arm64/libcircom_witnesscalc.a | grep -q '/Users/'; then
+            echo "build-machine paths leaked into the device slice:" >&2
+            strings -a libcircom_witnesscalc.xcframework/ios-arm64/libcircom_witnesscalc.a \
+              | grep -o '/Users/[A-Za-z0-9._-]*' | sort -u >&2
+            exit 1
+          fi
+
+      - name: package
+        run: |
+          cd "$XCF_DIR"
+          zip -X -q -9 -r libcircom_witnesscalc.xcframework.zip libcircom_witnesscalc.xcframework
+          shasum -a 256 libcircom_witnesscalc.xcframework.zip \
+            | tee libcircom_witnesscalc.xcframework.sha256
+          echo "--- pin this digest downstream ---"
+          awk '{ print $1 }' libcircom_witnesscalc.xcframework.sha256
+
+      # Binds the artifact to this source commit and this workflow run.
+      # Consumers check it with:
+      #   gh attestation verify <zip> --repo <owner>/<repo>
+      - name: attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: ${{ env.XCF_DIR }}/libcircom_witnesscalc.xcframework.zip
+
+      # Dispatch runs stop here, so the workflow can be exercised without
+      # cutting a release.
+      - name: upload as a workflow artifact
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: libcircom_witnesscalc-xcframework
+          path: |
+            ${{ env.XCF_DIR }}/libcircom_witnesscalc.xcframework.zip
+            ${{ env.XCF_DIR }}/libcircom_witnesscalc.xcframework.sha256
+
+      - name: cut the release
+        if: startsWith(github.ref, 'refs/tags/ios-xcframework-v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd "$XCF_DIR"
+          gh release create "${GITHUB_REF_NAME}" \
+            libcircom_witnesscalc.xcframework.zip \
+            libcircom_witnesscalc.xcframework.sha256 \
+            --title "iOS xcframework ${GITHUB_REF_NAME}" \
+            --notes "Built from \`${GITHUB_SHA}\` by \`${GITHUB_WORKFLOW}\` run [${GITHUB_RUN_ID}](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}).
+
+          Source is upstream iden3/circom-witnesscalc at \`ae15c65bfa896726c6fa293d7ce8e2b18a9625b0\`; this branch adds only the build workflow.
+
+          Verify before use:
+          \`\`\`
+          gh attestation verify libcircom_witnesscalc.xcframework.zip --repo ${GITHUB_REPOSITORY}
+          \`\`\`"
