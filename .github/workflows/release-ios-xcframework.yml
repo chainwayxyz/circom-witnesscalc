@@ -47,6 +47,14 @@ jobs:
           rustup target add aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios
           rustc --version
 
+      # build.rs generates protobuf bindings before it reaches bindgen, and
+      # prost-build shells out to protoc rather than vendoring one. It is a
+      # build-time code generator only — nothing from it ships in the artifact.
+      - name: install protoc
+        run: |
+          brew install protobuf
+          protoc --version
+
       - name: build the three iOS targets
         run: |
           IOS_SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
