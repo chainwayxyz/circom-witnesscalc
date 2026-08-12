@@ -52,7 +52,7 @@ jobs:
       # build-time code generator only — nothing from it ships in the artifact.
       - name: install protoc
         run: |
-          brew install protobuf
+          HOMEBREW_NO_AUTO_UPDATE=1 brew install protobuf
           protoc --version
 
       - name: build the three iOS targets
