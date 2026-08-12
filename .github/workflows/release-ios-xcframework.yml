@@ -208,7 +208,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           cd "$XCF_DIR"
+          # --repo is required: this runs from $XCF_DIR, which is outside the
+          # checkout, and gh otherwise infers the target repo from the git remote
+          # in the working directory.
           gh release create "${GITHUB_REF_NAME}" \
+            --repo "${GITHUB_REPOSITORY}" \
             libcircom_witnesscalc.xcframework.zip \
             libcircom_witnesscalc.xcframework.sha256 \
             --title "iOS xcframework ${GITHUB_REF_NAME}" \
