@@ -177,7 +177,22 @@ jobs:
       - name: package
         run: |
           cd "$XCF_DIR"
-          zip -X -q -9 -r libcircom_witnesscalc.xcframework.zip libcircom_witnesscalc.xcframework
+
+          # The .a files this job produces are already byte-identical run to run —
+          # pinned toolchain and runner image, codegen-units = 1, and paths remapped.
+          # Left alone, the archive would not be: zip records each entry's mtime, so
+          # two runs of the same source differ only by the clock. Stamping every entry
+          # to the zip epoch and feeding a sorted file list makes the archive a pure
+          # function of its contents, so the published digest can be reproduced by
+          # rebuilding rather than only attested to.
+          #
+          # -X already drops uid/gid and extra attributes; mtime and entry order were
+          # the remaining inputs.
+          find libcircom_witnesscalc.xcframework -exec touch -h -t 198001010000.00 {} +
+          find libcircom_witnesscalc.xcframework -print \
+            | LC_ALL=C sort \
+            | zip -X -q -9 -@ libcircom_witnesscalc.xcframework.zip
+
           shasum -a 256 libcircom_witnesscalc.xcframework.zip \
             | tee libcircom_witnesscalc.xcframework.sha256
           echo "--- pin this digest downstream ---"
